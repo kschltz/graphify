@@ -5,7 +5,7 @@ import pytest
 from graphify.extract import (
     extract_java, extract_c, extract_cpp, extract_ruby,
     extract_csharp, extract_kotlin, extract_scala, extract_php,
-    extract_swift, extract_go, extract_julia,
+    extract_swift, extract_go, extract_julia, extract_clojure,
 )
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -557,6 +557,78 @@ def test_julia_finds_calls():
 
 def test_julia_no_dangling_edges():
     r = extract_julia(FIXTURES / "sample.jl")
+    node_ids = {n["id"] for n in r["nodes"]}
+    for e in r["edges"]:
+        assert e["source"] in node_ids, f"Dangling source: {e}"
+
+
+# ── Clojure ─────────────────────────────────────────────────────────────────
+
+def test_clojure_no_error():
+    r = extract_clojure(FIXTURES / "sample.clj")
+    assert "error" not in r
+
+def test_clojure_finds_namespace():
+    r = extract_clojure(FIXTURES / "sample.clj")
+    labels = _labels(r)
+    assert any("sample.core" in l for l in labels)
+
+def test_clojure_finds_def():
+    r = extract_clojure(FIXTURES / "sample.clj")
+    labels = _labels(r)
+    assert "x" in labels
+
+def test_clojure_finds_defn():
+    r = extract_clojure(FIXTURES / "sample.clj")
+    labels = _labels(r)
+    assert any("greet()" in l for l in labels)
+
+def test_clojure_finds_defmacro():
+    r = extract_clojure(FIXTURES / "sample.clj")
+    labels = _labels(r)
+    assert any("unless (macro)" in l for l in labels)
+
+def test_clojure_finds_defmulti():
+    r = extract_clojure(FIXTURES / "sample.clj")
+    labels = _labels(r)
+    assert any("process (multimethod)" in l for l in labels)
+
+def test_clojure_finds_defmethod():
+    r = extract_clojure(FIXTURES / "sample.clj")
+    labels = _labels(r)
+    assert any("process[String]" in l for l in labels)
+
+def test_clojure_finds_defprotocol():
+    r = extract_clojure(FIXTURES / "sample.clj")
+    labels = _labels(r)
+    assert any("Drawable (protocol)" in l for l in labels)
+
+def test_clojure_finds_protocol_methods():
+    r = extract_clojure(FIXTURES / "sample.clj")
+    labels = _labels(r)
+    assert any("draw()" in l for l in labels)
+
+def test_clojure_finds_deftype():
+    r = extract_clojure(FIXTURES / "sample.clj")
+    labels = _labels(r)
+    assert "Point" in labels
+
+def test_clojure_finds_defrecord():
+    r = extract_clojure(FIXTURES / "sample.clj")
+    labels = _labels(r)
+    assert "Person" in labels
+
+def test_clojure_finds_requires():
+    r = extract_clojure(FIXTURES / "sample.clj")
+    assert "requires" in _relations(r)
+
+def test_clojure_finds_calls():
+    r = extract_clojure(FIXTURES / "sample.clj")
+    call_edges = [e for e in r["edges"] if e["relation"] == "calls"]
+    assert len(call_edges) >= 1
+
+def test_clojure_no_dangling_edges():
+    r = extract_clojure(FIXTURES / "sample.clj")
     node_ids = {n["id"] for n in r["nodes"]}
     for e in r["edges"]:
         assert e["source"] in node_ids, f"Dangling source: {e}"

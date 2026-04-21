@@ -3047,6 +3047,416 @@ def extract_elixir(path: Path) -> dict:
     return {"nodes": nodes, "edges": clean_edges, "raw_calls": raw_calls, "input_tokens": 0, "output_tokens": 0}
 
 
+# ── Clojure extractor (custom walk) ─────────────────────────────────────────
+
+def extract_clojure(path: Path) -> dict:
+    """Extract namespaces, vars, functions, protocols, types, imports, and calls from .clj/.cljs/.cljc."""
+    try:
+        import tree_sitter_clojure_orchard as tsclj
+        from tree_sitter import Language, Parser
+    except ImportError:
+        return {"nodes": [], "edges": [], "error": "tree-sitter-clojure-orchard not installed"}
+
+    try:
+        language = Language(tsclj.language())
+        parser = Parser(language)
+        source = path.read_bytes()
+        tree = parser.parse(source)
+        root = tree.root_node
+    except Exception as e:
+        return {"nodes": [], "edges": [], "error": str(e)}
+
+    stem = path.stem
+    str_path = str(path)
+    nodes: list[dict] = []
+    edges: list[dict] = []
+    seen_ids: set[str] = set()
+    function_bodies: list[tuple[str, list]] = []
+
+    def add_node(nid: str, label: str, line: int) -> None:
+        if nid and nid not in seen_ids:
+            seen_ids.add(nid)
+            nodes.append({
+                "id": nid, "label": label, "file_type": "code",
+                "source_file": str_path, "source_location": f"L{line}",
+            })
+
+    def add_edge(src: str, tgt: str, relation: str, line: int,
+                 confidence: str = "EXTRACTED", weight: float = 1.0) -> None:
+        if src and tgt:
+            edges.append({
+                "source": src, "target": tgt, "relation": relation,
+                "confidence": confidence, "source_file": str_path,
+                "source_location": f"L{line}", "weight": weight,
+            })
+
+    file_nid = _make_id(str_path)
+    add_node(file_nid, path.name, 1)
+
+    current_ns: str | None = None
+
+    def _sym_text(n) -> str | None:
+        """Get the plain symbol text (without meta) from a sym_lit node."""
+        if n.type != "sym_lit":
+            return None
+        name_n = n.child_by_field_name("sym_name")
+        if name_n:
+            return _read_text(name_n, source)
+        # fallback: any child named sym_name
+        for c in n.children:
+            if c.type == "sym_name":
+                return _read_text(c, source)
+        return None
+
+    def _kwd_text(n) -> str | None:
+        """Get the plain keyword text without the leading colon."""
+        if n.type != "kwd_lit":
+            return None
+        name_n = n.child_by_field_name("kwd_name")
+        if name_n:
+            return _read_text(name_n, source)
+        for c in n.children:
+            if c.type == "kwd_name":
+                return _read_text(c, source)
+        return None
+
+    def _get_first_sym_lit(node) -> str | None:
+        """Head symbol of a list_lit (first significant child after delimiters)."""
+        for c in node.children:
+            if c.type in ("(", ")", "#", "[", "]", "{", "}"):
+                continue
+            if c.type == "sym_lit":
+                return _sym_text(c)
+            return None
+        return None
+
+    def _get_name_after_head(node) -> str | None:
+        """Get the first argument (usually the name) after the head symbol."""
+        found_head = False
+        for c in node.children:
+            if c.type == "sym_lit":
+                if not found_head:
+                    found_head = True
+                    continue
+                t = _sym_text(c)
+                if t is not None:
+                    return t
+        return None
+
+    def _collect_body_nodes(node) -> list:
+        """Collect children after the arg-vector."""
+        body_nodes = []
+        in_body = False
+        for c in node.children[1:]:
+            if in_body:
+                body_nodes.append(c)
+            elif c.type == "vec_lit":
+                in_body = True
+        return body_nodes
+
+    def _node_text(node) -> str:
+        return _read_text(node, source)
+
+    def _parse_libspecs(libspec_nodes, from_ns: str, relation: str) -> None:
+        src_nid = _make_id(from_ns)
+        if not src_nid:
+            return
+        for c in libspec_nodes:
+            if c.type == "vec_lit":
+                first_sym = _get_first_sym_lit(c)
+                if first_sym:
+                    tgt_nid = _make_id(first_sym)
+                    if tgt_nid:
+                        add_edge(src_nid, tgt_nid, relation, c.start_point[0] + 1)
+            elif c.type == "sym_lit":
+                sym = _sym_text(c)
+                if sym:
+                    tgt_nid = _make_id(sym)
+                    if tgt_nid:
+                        add_edge(src_nid, tgt_nid, relation, c.start_point[0] + 1)
+
+    def _parse_imports(import_nodes, from_ns: str) -> None:
+        src_nid = _make_id(from_ns)
+        if not src_nid:
+            return
+        for c in import_nodes:
+            if c.type == "vec_lit":
+                parts = []
+                for sub in c.children:
+                    if sub.type == "sym_lit":
+                        t = _sym_text(sub)
+                        if t:
+                            parts.append(t)
+                if parts:
+                    class_name = parts[-1]
+                    tgt_nid = _make_id(class_name)
+                    if tgt_nid:
+                        add_edge(src_nid, tgt_nid, "imports", c.start_point[0] + 1)
+
+    def _parse_ns_deps(ns_node, ns_name: str) -> None:
+        for c in ns_node.children[1:]:
+            if c.type == "list_lit":
+                kw = None
+                for sub in c.children:
+                    if sub.type == "kwd_lit":
+                        k = _kwd_text(sub)
+                        if k:
+                            kw = k
+                            break
+                if kw == "require":
+                    _parse_libspecs(c.children[1:], ns_name, "requires")
+                elif kw == "use":
+                    _parse_libspecs(c.children[1:], ns_name, "uses")
+                elif kw == "import":
+                    _parse_imports(c.children[1:], ns_name)
+
+    # Phase 1: extract top-level definitions
+    for child in root.children:
+        if child.type != "list_lit":
+            continue
+        head = _get_first_sym_lit(child)
+        if not head:
+            continue
+        line = child.start_point[0] + 1
+
+        if head == "ns":
+            ns_name = _get_name_after_head(child)
+            if ns_name:
+                current_ns = ns_name
+                ns_nid = _make_id(ns_name)
+                if ns_nid:
+                    add_node(ns_nid, ns_name, line)
+                    add_edge(file_nid, ns_nid, "contains", line)
+                    _parse_ns_deps(child, ns_name)
+            continue
+
+        if head in ("def", "defonce"):
+            def_name = _get_name_after_head(child)
+            if def_name and current_ns:
+                var_nid = _make_id(current_ns, def_name)
+                if var_nid:
+                    add_node(var_nid, def_name, line)
+                    ns_nid = _make_id(current_ns)
+                    if ns_nid:
+                        add_edge(ns_nid, var_nid, "contains", line)
+            continue
+
+        if head in ("defn", "defn-"):
+            def_name = _get_name_after_head(child)
+            if def_name and current_ns:
+                func_nid = _make_id(current_ns, def_name)
+                if func_nid:
+                    add_node(func_nid, f"{def_name}()", line)
+                    ns_nid = _make_id(current_ns)
+                    if ns_nid:
+                        add_edge(ns_nid, func_nid, "contains", line)
+                    body = _collect_body_nodes(child)
+                    if body:
+                        function_bodies.append((func_nid, body))
+            continue
+
+        if head == "defmacro":
+            def_name = _get_name_after_head(child)
+            if def_name and current_ns:
+                var_nid = _make_id(current_ns, def_name)
+                if var_nid:
+                    add_node(var_nid, f"{def_name} (macro)", line)
+                    ns_nid = _make_id(current_ns)
+                    if ns_nid:
+                        add_edge(ns_nid, var_nid, "contains", line)
+                    body = _collect_body_nodes(child)
+                    if body:
+                        function_bodies.append((var_nid, body))
+            continue
+
+        if head == "defmulti":
+            def_name = _get_name_after_head(child)
+            if def_name and current_ns:
+                var_nid = _make_id(current_ns, def_name)
+                if var_nid:
+                    add_node(var_nid, f"{def_name} (multimethod)", line)
+                    ns_nid = _make_id(current_ns)
+                    if ns_nid:
+                        add_edge(ns_nid, var_nid, "contains", line)
+            continue
+
+        if head == "defmethod":
+            multi_name = _get_name_after_head(child)
+            if multi_name and current_ns:
+                dispatch = None
+                skipped_multi = False
+                for c in child.children:
+                    if c.type == "sym_lit" and _sym_text(c) == multi_name:
+                        skipped_multi = True
+                        continue
+                    if skipped_multi and c.type in ("sym_lit", "kwd_lit", "str_lit", "num_lit", "list_lit", "vec_lit", "map_lit", "set_lit"):
+                        dispatch = _node_text(c)
+                        break
+                method_label = f"{multi_name}[{dispatch}]" if dispatch else multi_name
+                method_nid = _make_id(current_ns, multi_name, dispatch or "")
+                if method_nid:
+                    add_node(method_nid, method_label, line)
+                    ns_nid = _make_id(current_ns)
+                    if ns_nid:
+                        add_edge(ns_nid, method_nid, "contains", line)
+                    body = _collect_body_nodes(child)
+                    if body:
+                        function_bodies.append((method_nid, body))
+            continue
+
+        if head == "defprotocol":
+            proto_name = _get_name_after_head(child)
+            if proto_name and current_ns:
+                proto_nid = _make_id(current_ns, proto_name)
+                if proto_nid:
+                    add_node(proto_nid, f"{proto_name} (protocol)", line)
+                    ns_nid = _make_id(current_ns)
+                    if ns_nid:
+                        add_edge(ns_nid, proto_nid, "contains", line)
+                    for c in child.children[2:]:
+                        if c.type == "list_lit":
+                            m_name = _get_first_sym_lit(c)
+                            if m_name:
+                                m_nid = _make_id(proto_nid, m_name)
+                                if m_nid:
+                                    add_node(m_nid, f"{m_name}()", c.start_point[0] + 1)
+                                    add_edge(proto_nid, m_nid, "method", c.start_point[0] + 1)
+            continue
+
+        if head in ("deftype", "defrecord"):
+            type_name = _get_name_after_head(child)
+            if type_name and current_ns:
+                type_nid = _make_id(current_ns, type_name)
+                if type_nid:
+                    add_node(type_nid, type_name, line)
+                    ns_nid = _make_id(current_ns)
+                    if ns_nid:
+                        add_edge(ns_nid, type_nid, "contains", line)
+                    after_fields = False
+                    for c in child.children[2:]:
+                        if c.type == "vec_lit":
+                            after_fields = True
+                            continue
+                        if after_fields:
+                            if c.type == "sym_lit":
+                                proto_name = _sym_text(c)
+                                if proto_name:
+                                    proto_nid = _make_id(proto_name)
+                                    if proto_nid:
+                                        add_edge(type_nid, proto_nid, "implements", line)
+                            elif c.type == "list_lit":
+                                m_name = _get_first_sym_lit(c)
+                                if m_name:
+                                    m_nid = _make_id(type_nid, m_name)
+                                    if m_nid:
+                                        add_node(m_nid, f".{m_name}()", c.start_point[0] + 1)
+                                        add_edge(type_nid, m_nid, "method", c.start_point[0] + 1)
+                                    body = _collect_body_nodes(c)
+                                    if body:
+                                        function_bodies.append((m_nid or type_nid, body))
+            continue
+
+        if head in ("require", "use"):
+            relation = "requires" if head == "require" else "uses"
+            for c in child.children[1:]:
+                if c.type == "vec_lit":
+                    lib_name = _get_first_sym_lit(c)
+                    if lib_name:
+                        tgt_nid = _make_id(lib_name)
+                        src_nid = _make_id(current_ns) if current_ns else file_nid
+                        if src_nid and tgt_nid:
+                            add_edge(src_nid, tgt_nid, relation, c.start_point[0] + 1)
+                elif c.type == "sym_lit":
+                    lib_name = _sym_text(c)
+                    if lib_name:
+                        tgt_nid = _make_id(lib_name)
+                        src_nid = _make_id(current_ns) if current_ns else file_nid
+                        if src_nid and tgt_nid:
+                            add_edge(src_nid, tgt_nid, relation, c.start_point[0] + 1)
+            continue
+
+        if head == "import":
+            for c in child.children[1:]:
+                if c.type == "vec_lit":
+                    parts = []
+                    for sub in c.children:
+                        if sub.type == "sym_lit":
+                            t = _sym_text(sub)
+                            if t:
+                                parts.append(t)
+                    if parts:
+                        class_name = parts[-1]
+                        tgt_nid = _make_id(class_name)
+                        src_nid = _make_id(current_ns) if current_ns else file_nid
+                        if src_nid and tgt_nid:
+                            add_edge(src_nid, tgt_nid, "imports", c.start_point[0] + 1)
+            continue
+
+    # Phase 2: call extraction from function bodies
+    label_to_nid: dict[str, str] = {}
+    for n in nodes:
+        normalised = n["label"].strip("()").split("[")[0].strip()
+        if normalised:
+            label_to_nid[normalised.lower()] = n["id"]
+
+    seen_call_pairs: set[tuple[str, str]] = set()
+    raw_calls: list[dict] = []
+
+    _SKIP_SYMBOLS = frozenset({
+        "ns", "def", "defn", "defn-", "defmacro", "defmulti", "defmethod",
+        "defprotocol", "deftype", "defrecord", "defonce", "defstruct",
+        "if", "do", "let", "letfn", "quote", "var", "fn", "loop", "recur",
+        "throw", "try", "catch", "finally", "monitor-enter", "monitor-exit",
+        "new", "set!", ".", "..",
+        "when", "when-not", "when-let", "when-first", "if-let", "if-not",
+        "cond", "condp", "case", "or", "and", "->", "->>", "->>>", "as->",
+        "doto", "locking", "binding", "with-open", "with-local-vars",
+        "with-precision", "with-redefs", "dotimes", "doseq", "for",
+        "comment", "declare", "delay", "future", "lazy-seq", "lazy-cat",
+        "time", "assert", "dosync", "io!", "gen-class", "gen-interface",
+        "proxy", "reify", "extend-type", "extend-protocol",
+        "import", "use", "require", "refer", "refer-clojure", "in-ns",
+        "load", "load-file", "load-string", "load-reader",
+    })
+
+    def _record_call(callee: str, caller_nid: str, line: int) -> None:
+        local_callee = callee.split("/")[-1] if "/" in callee else callee
+        tgt = label_to_nid.get(local_callee.lower())
+        if tgt and tgt != caller_nid:
+            pair = (caller_nid, tgt)
+            if pair not in seen_call_pairs:
+                seen_call_pairs.add(pair)
+                add_edge(caller_nid, tgt, "calls", line, confidence="INFERRED", weight=1.0)
+        else:
+            raw_calls.append({
+                "caller_nid": caller_nid,
+                "callee": local_callee,
+                "source_file": str_path,
+                "source_location": f"L{line}",
+            })
+
+    def _walk_calls(node, caller_nid: str) -> None:
+        if not node:
+            return
+        if node.type == "list_lit":
+            callee = _get_first_sym_lit(node)
+            if callee and callee not in _SKIP_SYMBOLS:
+                _record_call(callee, caller_nid, node.start_point[0] + 1)
+            for c in node.children:
+                _walk_calls(c, caller_nid)
+        elif node.type in ("vec_lit", "map_lit", "set_lit"):
+            for c in node.children:
+                _walk_calls(c, caller_nid)
+
+    for caller_nid, body in function_bodies:
+        for node in body:
+            _walk_calls(node, caller_nid)
+
+    clean_edges = [e for e in edges if e["source"] in seen_ids and
+                   (e["target"] in seen_ids or e["relation"] in ("requires", "uses", "imports"))]
+    return {"nodes": nodes, "edges": clean_edges, "raw_calls": raw_calls, "input_tokens": 0, "output_tokens": 0}
+
+
 # ── Main extract and collect_files ────────────────────────────────────────────
 
 
@@ -3137,6 +3547,9 @@ def extract(paths: list[Path], cache_root: Path | None = None) -> dict:
         ".dart": extract_dart,
         ".v": extract_verilog,
         ".sv": extract_verilog,
+        ".clj": extract_clojure,
+        ".cljs": extract_clojure,
+        ".cljc": extract_clojure,
     }
 
     total = len(paths)
@@ -3227,6 +3640,7 @@ def collect_files(target: Path, *, follow_symlinks: bool = False, root: Path | N
         ".rb", ".cs", ".kt", ".kts", ".scala", ".php", ".swift",
         ".lua", ".toc", ".zig", ".ps1",
         ".m", ".mm",
+        ".clj", ".cljs", ".cljc",
     }
     from graphify.detect import _load_graphifyignore, _is_ignored
     ignore_root = root if root is not None else target

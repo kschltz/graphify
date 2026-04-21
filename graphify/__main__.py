@@ -110,6 +110,11 @@ _PLATFORM_CONFIG: dict[str, dict] = {
         "skill_dst": Path(".hermes") / "skills" / "graphify" / "SKILL.md",
         "claude_md": False,
     },
+    "pi": {
+        "skill_file": "skill-pi.md",
+        "skill_dst": Path(".pi") / "agent" / "skills" / "graphify" / "SKILL.md",
+        "claude_md": False,
+    },
     "kiro": {
         "skill_file": "skill-kiro.md",
         "skill_dst": Path(".kiro") / "skills" / "graphify" / "SKILL.md",
@@ -914,7 +919,7 @@ def main() -> None:
         print("Usage: graphify <command>")
         print()
         print("Commands:")
-        print("  install [--platform P]  copy skill to platform config dir (claude|windows|codex|opencode|aider|claw|droid|trae|trae-cn|gemini|cursor|antigravity|hermes|kiro)")
+        print("  install [--platform P]  copy skill to platform config dir (claude|windows|codex|opencode|aider|claw|droid|trae|trae-cn|gemini|cursor|antigravity|hermes|kiro|pi)")
         print("  path \"A\" \"B\"            shortest path between two nodes in graph.json")
         print("    --graph <path>          path to graph.json (default graphify-out/graph.json)")
         print("  explain \"X\"             plain-language explanation of a node and its neighbors")
@@ -970,6 +975,8 @@ def main() -> None:
         print("  hermes uninstall        remove skill from ~/.hermes/skills/graphify/")
         print("  kiro install            write skill to .kiro/skills/graphify/ + steering file (Kiro IDE/CLI)")
         print("  kiro uninstall          remove skill + steering file")
+        print("  pi install              write skill to ~/.pi/agent/skills/graphify/ (pi coding agent)")
+        print("  pi uninstall            remove skill from ~/.pi/agent/skills/graphify/")
         print()
         return
 
@@ -1076,6 +1083,27 @@ def main() -> None:
             _antigravity_uninstall(Path("."))
         else:
             print("Usage: graphify antigravity [install|uninstall]", file=sys.stderr)
+            sys.exit(1)
+    elif cmd == "pi":
+        subcmd = sys.argv[2] if len(sys.argv) > 2 else ""
+        if subcmd == "install":
+            install(platform="pi")
+        elif subcmd == "uninstall":
+            skill_dst = Path.home() / _PLATFORM_CONFIG["pi"]["skill_dst"]
+            if skill_dst.exists():
+                skill_dst.unlink()
+                print(f"  skill removed    ->  {skill_dst}")
+            version_file = skill_dst.parent / ".graphify_version"
+            if version_file.exists():
+                version_file.unlink()
+            for d in (skill_dst.parent, skill_dst.parent.parent):
+                try:
+                    d.rmdir()
+                except OSError:
+                    break
+            print("graphify skill removed from pi.")
+        else:
+            print("Usage: graphify pi [install|uninstall]", file=sys.stderr)
             sys.exit(1)
     elif cmd == "hook":
         from graphify.hooks import install as hook_install, uninstall as hook_uninstall, status as hook_status

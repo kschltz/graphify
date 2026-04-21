@@ -1,0 +1,1 @@
+{"ts":1.776808416173E9,"role":"human","action":"note","content":"Starting: will test 'graphify install --platform pi' and 'graphify pi install' in worktree, verify skill file lands at ~/.pi/agent/skills/graphify/SKILL.md"}

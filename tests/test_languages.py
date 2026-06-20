@@ -5,7 +5,7 @@ import pytest
 from graphify.extract import (
     extract_java, extract_c, extract_cpp, extract_ruby,
     extract_csharp, extract_kotlin, extract_scala, extract_php,
-    extract_swift, extract_go, extract_julia, extract_clojure,
+extract_swift, extract_go, extract_julia, extract_clojure,
 )
 
 FIXTURES = Path(__file__).parent / "fixtures"
